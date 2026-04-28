@@ -45,6 +45,11 @@ export interface LLMHealthError {
   model: string;
 }
 
+export interface JobsUpgradeState {
+  message: string;
+  namespace?: string | null;
+}
+
 export type ActivityStatus =
   | { type: 'idle' }
   | { type: 'thinking' }
@@ -52,6 +57,19 @@ export type ActivityStatus =
   | { type: 'waiting-approval' }
   | { type: 'streaming' }
   | { type: 'cancelled' };
+
+export interface ResearchAgentStats {
+  toolCount: number;
+  tokenCount: number;
+  startedAt: number | null;
+  finalElapsed: number | null;
+}
+
+export interface ResearchAgentState {
+  label: string;
+  steps: string[];
+  stats: ResearchAgentStats;
+}
 
 /** State that is tracked per-session (each session has its own copy). */
 export interface PerSessionState {
@@ -61,11 +79,15 @@ export interface PerSessionState {
   panelView: PanelView;
   panelEditable: boolean;
   plan: PlanItem[];
-  /** Steps completed by the research sub-agent (tool_log events). */
+  /** Per-agent research state, keyed by agent_id. */
+  researchAgents: Record<string, ResearchAgentState>;
+  /** @deprecated kept for backward compat selectors — use researchAgents instead */
   researchSteps: string[];
-  /** Live stats from the research sub-agent. */
-  researchStats: { toolCount: number; tokenCount: number; startedAt: number | null; finalElapsed: number | null };
+  /** @deprecated kept for backward compat selectors — use researchAgents instead */
+  researchStats: ResearchAgentStats;
 }
+
+const defaultResearchStats: ResearchAgentStats = { toolCount: 0, tokenCount: 0, startedAt: null, finalElapsed: null };
 
 const defaultSessionState: PerSessionState = {
   isProcessing: false,
@@ -74,8 +96,9 @@ const defaultSessionState: PerSessionState = {
   panelView: 'script',
   panelEditable: false,
   plan: [],
+  researchAgents: {},
   researchSteps: [],
-  researchStats: { toolCount: 0, tokenCount: 0, startedAt: null, finalElapsed: null },
+  researchStats: { ...defaultResearchStats },
 };
 
 interface AgentStore {
@@ -90,6 +113,9 @@ interface AgentStore {
   user: User | null;
   error: string | null;
   llmHealthError: LLMHealthError | null;
+  /** Set when a Claude-send hits the daily quota — ChatInput opens the cap dialog in response. */
+  claudeQuotaExhausted: boolean;
+  jobsUpgradeRequired: JobsUpgradeState | null;
 
   // Right panel (single-artifact pattern)
   panelData: PanelData | null;
@@ -107,6 +133,11 @@ interface AgentStore {
 
   // Job statuses (tool_call_id -> job status) for HF jobs
   jobStatuses: Record<string, string>;
+
+  // Trackio dashboard config per tool call (tool_call_id -> {spaceId, project?})
+  // Set by hf_jobs / sandbox_create tools when the agent declares trackio_space_id;
+  // the UI uses it to embed the live dashboard via an iframe.
+  trackioDashboards: Record<string, { spaceId: string; project?: string }>;
 
   // Tool error states (tool_call_id -> true if errored) - persisted across renders
   toolErrors: Record<string, boolean>;
@@ -135,6 +166,8 @@ interface AgentStore {
   setUser: (user: User | null) => void;
   setError: (error: string | null) => void;
   setLlmHealthError: (error: LLMHealthError | null) => void;
+  setClaudeQuotaExhausted: (exhausted: boolean) => void;
+  setJobsUpgradeRequired: (state: JobsUpgradeState | null) => void;
 
   setPanel: (data: PanelData, view?: PanelView, editable?: boolean) => void;
   setPanelView: (view: PanelView) => void;
@@ -154,6 +187,9 @@ interface AgentStore {
 
   setJobStatus: (toolCallId: string, status: string) => void;
   getJobStatus: (toolCallId: string) => string | undefined;
+
+  setTrackioDashboard: (toolCallId: string, spaceId: string, project?: string) => void;
+  getTrackioDashboard: (toolCallId: string) => { spaceId: string; project?: string } | undefined;
 
   setToolError: (toolCallId: string, hasError: boolean) => void;
   getToolError: (toolCallId: string) => boolean | undefined;
@@ -219,6 +255,26 @@ function saveRejectedTools(rejected: Record<string, boolean>): void {
   }
 }
 
+// Trackio dashboards survive a page reload — without persistence the iframe
+// disappears whenever the user refreshes mid-job, which is the exact moment
+// they'd want to keep watching it.
+function loadTrackioDashboards(): Record<string, { spaceId: string; project?: string }> {
+  try {
+    const stored = localStorage.getItem('hf-agent-trackio-dashboards');
+    return stored ? JSON.parse(stored) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveTrackioDashboards(dashboards: Record<string, { spaceId: string; project?: string }>): void {
+  try {
+    localStorage.setItem('hf-agent-trackio-dashboards', JSON.stringify(dashboards));
+  } catch (e) {
+    console.warn('Failed to persist trackio dashboards:', e);
+  }
+}
+
 export const useAgentStore = create<AgentStore>()((set, get) => ({
   sessionStates: {},
   activeSessionId: null,
@@ -229,6 +285,8 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
   user: null,
   error: null,
   llmHealthError: null,
+  claudeQuotaExhausted: false,
+  jobsUpgradeRequired: null,
 
   panelData: null,
   panelView: 'script',
@@ -239,6 +297,7 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
   editedScripts: {},
   jobUrls: {},
   jobStatuses: {},
+  trackioDashboards: loadTrackioDashboards(),
   toolErrors: loadToolErrors(),
   rejectedTools: loadRejectedTools(),
 
@@ -299,8 +358,9 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
         panelView: state.panelView,
         panelEditable: state.panelEditable,
         plan: state.plan,
+        researchAgents: state.sessionStates[state.activeSessionId]?.researchAgents ?? {},
         researchSteps: state.sessionStates[state.activeSessionId]?.researchSteps ?? [],
-        researchStats: state.sessionStates[state.activeSessionId]?.researchStats ?? defaultSessionState.researchStats,
+        researchStats: state.sessionStates[state.activeSessionId]?.researchStats ?? { ...defaultResearchStats },
       };
     }
 
@@ -339,6 +399,8 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
   setUser: (user) => set({ user }),
   setError: (error) => set({ error }),
   setLlmHealthError: (error) => set({ llmHealthError: error }),
+  setClaudeQuotaExhausted: (exhausted) => set({ claudeQuotaExhausted: exhausted }),
+  setJobsUpgradeRequired: (state) => set({ jobsUpgradeRequired: state }),
 
   // ── Panel (single-artifact) ───────────────────────────────────────
   // Each setter also patches the active session's snapshot so that
@@ -423,6 +485,26 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
   },
 
   getJobStatus: (toolCallId) => get().jobStatuses[toolCallId],
+
+  // ── Trackio Dashboards ──────────────────────────────────────────────
+
+  setTrackioDashboard: (toolCallId, spaceId, project) => {
+    set((state) => {
+      const existing = state.trackioDashboards[toolCallId];
+      // Don't churn the object if nothing changed (avoids extra renders).
+      if (existing && existing.spaceId === spaceId && existing.project === project) {
+        return {};
+      }
+      const updated = {
+        ...state.trackioDashboards,
+        [toolCallId]: { spaceId, ...(project ? { project } : {}) },
+      };
+      saveTrackioDashboards(updated);
+      return { trackioDashboards: updated };
+    });
+  },
+
+  getTrackioDashboard: (toolCallId) => get().trackioDashboards[toolCallId],
 
   // ── Tool Errors ─────────────────────────────────────────────────────
 
